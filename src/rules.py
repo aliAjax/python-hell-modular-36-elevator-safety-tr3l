@@ -101,6 +101,60 @@ def _validate_permit(data, lookup):
         raise ValidationError("invalid permit purpose")
 
 
+def _validate_shift(data, lookup):
+    area = str(data.get("area", "")).strip()
+    if not area:
+        raise ValidationError("area is required")
+    dispatcher_id = data.get("dispatcher_id")
+    if dispatcher_id:
+        for shift in _all(lookup, "shift"):
+            if (
+                shift["status"] == "on_duty"
+                and shift["data"].get("dispatcher_id") == dispatcher_id
+                and shift["data"].get("area") == area
+            ):
+                raise ConflictError("dispatcher already on duty in this area")
+
+
+def _validate_takeover(data, lookup):
+    alarm = _find_one(lookup, "alarm", "id", data.get("alarm_id"))
+    if not alarm:
+        raise ValidationError("takeover requires alarm")
+    if alarm["status"] in ("resolved", "closed", "false_alarm"):
+        raise ValidationError("cannot take over a resolved, closed or false alarm")
+    shift = _find_one(lookup, "shift", "id", data.get("shift_id"))
+    if not shift or shift["status"] != "on_duty":
+        raise ValidationError("takeover requires an on-duty shift")
+    equipment = _find_one(lookup, "equipment", "id", alarm["data"].get("equipment_id"))
+    if equipment and equipment["data"].get("location") != shift["data"].get("area"):
+        raise ValidationError("alarm is not in your shift area")
+
+
+def _validate_handover(data, lookup):
+    from_shift = _find_one(lookup, "shift", "id", data.get("from_shift_id"))
+    to_shift = _find_one(lookup, "shift", "id", data.get("to_shift_id"))
+    if not from_shift or not to_shift:
+        raise ValidationError("handover requires both shifts")
+    if from_shift["status"] != "on_duty":
+        raise ValidationError("from_shift must be on duty to hand over")
+    if to_shift["status"] != "on_duty":
+        raise ValidationError("to_shift must be on duty to take over")
+    if from_shift["data"].get("area") != to_shift["data"].get("area"):
+        raise ValidationError("shifts must be in the same area")
+    if from_shift["data"].get("dispatcher_id") == to_shift["data"].get("dispatcher_id"):
+        raise ValidationError("cannot hand over to the same dispatcher")
+
+
+def _validate_escalation(data, lookup):
+    if not _find_one(lookup, "shift", "id", data.get("shift_id")):
+        raise ValidationError("escalation requires shift")
+    alarm = _find_one(lookup, "alarm", "id", data.get("alarm_id"))
+    if not alarm:
+        raise ValidationError("escalation requires alarm")
+    if alarm["status"] in ("closed", "false_alarm"):
+        raise ValidationError("escalation only applies to unclosed alarms")
+
+
 def _grant_permit(actor, entity, data, lookup):
     equipment = _find_one(lookup, "equipment", "id", entity["data"].get("equipment_id"))
     if not equipment or equipment["status"] not in ("in_service", "suspended"):
@@ -130,12 +184,14 @@ class RuleEngine:
     ALIASES = {
         "equipments": "equipment", "inspections": "inspection", "maintenances": "maintenance",
         "alarms": "alarm", "rescue_jobs": "rescue_job", "remediations": "remediation",
-        "permits": "permit",
+        "permits": "permit", "shifts": "shift", "takeovers": "takeover",
+        "handovers": "handover", "escalations": "escalation",
     }
     INITIAL_STATUS = {
         "equipment": "in_service", "inspection": "scheduled", "maintenance": "planned",
         "alarm": "received", "rescue_job": "dispatched", "remediation": "open",
-        "permit": "blocked",
+        "permit": "blocked", "shift": "on_duty", "takeover": "active",
+        "handover": "pending", "escalation": "pending",
     }
     TRANSITIONS = {
         "equipment": {
@@ -175,6 +231,19 @@ class RuleEngine:
             "revoke": (("granted", "pending_review"), "revoked"),
             "expire": (("granted",), "expired"),
         },
+        "shift": {
+            "start_handover": (("on_duty",), "handing_over"),
+            "end": (("on_duty", "handing_over"), "ended"),
+        },
+        "takeover": {
+            "invalidate": (("active",), "invalid"),
+        },
+        "handover": {
+            "complete": (("pending",), "completed"),
+        },
+        "escalation": {
+            "notify": (("pending",), "notified"),
+        },
     }
     CREATE_REQUIRED = {
         "equipment": ("asset_no", "equipment_type", "location", "inspection_interval_days"),
@@ -184,6 +253,10 @@ class RuleEngine:
         "rescue_job": ("alarm_id", "dedupe_key", "team"),
         "remediation": ("issue", "owner", "due_at"),
         "permit": ("equipment_id", "purpose", "requested_by"),
+        "shift": ("area",),
+        "takeover": ("alarm_id",),
+        "handover": ("from_shift_id", "to_shift_id"),
+        "escalation": ("shift_id", "alarm_id", "reason"),
     }
     ACTION_REQUIRED = {
         ("inspection", "pass"): ("findings",),
@@ -202,6 +275,10 @@ class RuleEngine:
         "rescue_job": ("admin", "dispatcher"),
         "remediation": ("admin", "inspector", "maintenance"),
         "permit": ("admin", "inspector"),
+        "shift": ("admin", "dispatcher"),
+        "takeover": ("admin", "dispatcher"),
+        "handover": ("admin", "dispatcher"),
+        "escalation": ("admin", "dispatcher"),
     }
     ROLE_ACTIONS = {
         "suspend": ("admin", "inspector"),
@@ -225,6 +302,10 @@ class RuleEngine:
         "grant": ("admin", "inspector"),
         "revoke": ("admin", "inspector"),
         "expire": ("admin", "inspector"),
+        "start_handover": ("admin", "dispatcher"),
+        "end": ("admin", "dispatcher"),
+        "invalidate": ("admin", "dispatcher"),
+        "notify": ("admin", "dispatcher"),
     }
     CUSTOM_CREATE = {
         "equipment": lambda a, d, l: _validate_equipment(d, l),
@@ -234,6 +315,10 @@ class RuleEngine:
         "rescue_job": lambda a, d, l: _validate_rescue(d, l),
         "remediation": lambda a, d, l: _validate_remediation(d, l),
         "permit": lambda a, d, l: _validate_permit(d, l),
+        "shift": lambda a, d, l: _validate_shift(d, l),
+        "takeover": lambda a, d, l: _validate_takeover(d, l),
+        "handover": lambda a, d, l: _validate_handover(d, l),
+        "escalation": lambda a, d, l: _validate_escalation(d, l),
     }
     CUSTOM_TRANSITIONS = {
         ("permit", "grant"): _grant_permit,

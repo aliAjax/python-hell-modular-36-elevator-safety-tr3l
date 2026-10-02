@@ -54,6 +54,9 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_takeover_active_alarm
+                    ON entities(json_extract(data, '$.alarm_id'))
+                    WHERE kind = 'takeover' AND status = 'active';
             """)
 
     @staticmethod
@@ -72,13 +75,64 @@ class SQLiteRepository:
     def create_entity(self, entity_id, kind, status, data, actor_id):
         now = utcnow()
         payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
-        with self._connect() as connection:
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+                    "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
+                    (entity_id, kind, status, payload, actor_id, now, now),
+                )
+        except sqlite3.IntegrityError:
+            raise ConflictError("duplicate active record violates uniqueness constraint")
+        return self.get_entity(entity_id)
+
+    def takeover_alarm(self, alarm_id, takeover_id, shift_id, dispatcher_id, area, actor_id, transfer=False):
+        """Atomically take over an alarm, optionally transferring from the previous shift.
+
+        The partial unique index on active takeovers guarantees that only one active
+        takeover per alarm can exist. When ``transfer`` is False (the normal case),
+        concurrent callers race on the INSERT: the first to commit wins, the second
+        hits the unique index and gets a ConflictError. When ``transfer`` is True (a
+        handover), the existing active takeover is invalidated first, then the new
+        one is inserted.
+        """
+        now = utcnow()
+        payload = json.dumps(
+            {
+                "alarm_id": alarm_id,
+                "shift_id": shift_id,
+                "dispatcher_id": dispatcher_id,
+                "area": area,
+                "taken_at": now,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            if transfer:
+                connection.execute(
+                    "UPDATE entities SET status = 'invalid', version = version + 1, updated_at = ? "
+                    "WHERE kind = 'takeover' AND status = 'active' "
+                    "AND json_extract(data, '$.alarm_id') = ?",
+                    (now, alarm_id),
+                )
             connection.execute(
                 "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
-                "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
-                (entity_id, kind, status, payload, actor_id, now, now),
+                "VALUES (?, 'takeover', 'active', 1, ?, ?, ?, ?)",
+                (takeover_id, payload, actor_id, now, now),
             )
-        return self.get_entity(entity_id)
+            connection.commit()
+        except sqlite3.IntegrityError:
+            connection.rollback()
+            raise ConflictError("alarm already taken over by another dispatcher")
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(takeover_id)
 
     def get_entity(self, entity_id):
         with self._connect() as connection:

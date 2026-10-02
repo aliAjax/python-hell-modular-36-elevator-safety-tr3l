@@ -104,6 +104,21 @@ def create_handler(service, rules, static_dir):
                 if parts == ["api", "offline-records"]:
                     body = self._body()
                     return self._send(200, {"items": service.merge_offline(actor, body.get("records", []))})
+                if parts == ["api", "shifts"]:
+                    body = self._body()
+                    return self._send(201, service.start_shift(actor, body))
+                if parts == ["api", "takeovers", "take"]:
+                    body = self._body()
+                    return self._send(200, service.take_over_alarm(actor, body.get("alarm_id")))
+                if parts == ["api", "takeovers", "take-all"]:
+                    return self._send(200, {"items": service.take_over_all(actor)})
+                if parts == ["api", "handovers"]:
+                    body = self._body()
+                    return self._send(201, service.initiate_handover(actor, body.get("from_shift_id"), body.get("to_shift_id")))
+                if len(parts) == 4 and parts[0] == "api" and parts[1] == "handovers" and parts[3] == "complete":
+                    return self._send(200, service.complete_handover(actor, parts[2]))
+                if len(parts) == 4 and parts[0] == "api" and parts[1] == "shifts" and parts[3] == "end":
+                    return self._send(200, service.end_shift(actor, parts[2]))
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)
