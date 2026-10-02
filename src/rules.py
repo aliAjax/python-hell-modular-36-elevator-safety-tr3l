@@ -64,8 +64,13 @@ def _validate_maintenance(data, lookup):
 
 
 def _validate_alarm(data, lookup):
-    if not _find_one(lookup, "equipment", "id", data.get("equipment_id")):
+    equipment = _find_one(lookup, "equipment", "id", data.get("equipment_id"))
+    if not equipment:
         raise ValidationError("alarm requires equipment")
+    if not str(data.get("area", "")).strip():
+        data["area"] = equipment["data"].get("area") or equipment["data"].get("location")
+    if not str(data.get("area", "")).strip():
+        raise ValidationError("alarm area is required")
     for alarm in _all(lookup, "alarm"):
         if (
             alarm["data"].get("equipment_id") == data.get("equipment_id")
@@ -73,6 +78,31 @@ def _validate_alarm(data, lookup):
             and alarm["status"] not in ("closed", "false_alarm")
         ):
             raise ConflictError("active alarm already exists for equipment and code")
+
+
+def _validate_shift(actor, data, lookup):
+    if actor.role == "dispatcher":
+        data["dispatcher_id"] = actor.user_id
+    _require(data, ("dispatcher_id", "area", "starts_at", "ends_at"))
+    if actor.role not in ("admin", "supervisor") and str(data.get("dispatcher_id", "")).strip() != actor.user_id:
+        raise PermissionDenied("cannot create a shift for another dispatcher")
+    area = str(data.get("area", "")).strip()
+    dispatcher_id = str(data.get("dispatcher_id", "")).strip()
+    data["area"] = area
+    data["dispatcher_id"] = dispatcher_id
+    for field in ("starts_at", "ends_at"):
+        try:
+            datetime.fromisoformat(str(data.get(field)).replace("Z", "+00:00"))
+        except ValueError:
+            raise ValidationError(field + " must be ISO-8601")
+    if str(data.get("ends_at")) <= str(data.get("starts_at")):
+        raise ValidationError("ends_at must be later than starts_at")
+    for shift in _all(lookup, "shift"):
+        same_dispatcher = shift["data"].get("dispatcher_id") == dispatcher_id
+        same_area = shift["data"].get("area") == area
+        is_active = shift["status"] in ("scheduled", "on_duty", "handing_over")
+        if same_dispatcher and same_area and is_active:
+            raise ConflictError("dispatcher already has an active shift in this area")
 
 
 def _validate_rescue(data, lookup):
@@ -130,12 +160,13 @@ class RuleEngine:
     ALIASES = {
         "equipments": "equipment", "inspections": "inspection", "maintenances": "maintenance",
         "alarms": "alarm", "rescue_jobs": "rescue_job", "remediations": "remediation",
-        "permits": "permit",
+        "permits": "permit", "shifts": "shift", "handovers": "handover",
+        "escalations": "escalation", "alarm_takeovers": "alarm_takeover",
     }
     INITIAL_STATUS = {
         "equipment": "in_service", "inspection": "scheduled", "maintenance": "planned",
         "alarm": "received", "rescue_job": "dispatched", "remediation": "open",
-        "permit": "blocked",
+        "permit": "blocked", "shift": "scheduled",
     }
     TRANSITIONS = {
         "equipment": {
@@ -175,6 +206,17 @@ class RuleEngine:
             "revoke": (("granted", "pending_review"), "revoked"),
             "expire": (("granted",), "expired"),
         },
+        "shift": {
+            "start_duty": (("scheduled",), "on_duty"),
+            "begin_handover": (("on_duty",), "handing_over"),
+            "end_shift": (("on_duty", "handing_over"), "ended"),
+        },
+        "handover": {
+            "complete": (("in_handover",), "completed"),
+        },
+        "escalation": {
+            "resolve": (("open",), "resolved"),
+        },
     }
     CREATE_REQUIRED = {
         "equipment": ("asset_no", "equipment_type", "location", "inspection_interval_days"),
@@ -184,6 +226,7 @@ class RuleEngine:
         "rescue_job": ("alarm_id", "dedupe_key", "team"),
         "remediation": ("issue", "owner", "due_at"),
         "permit": ("equipment_id", "purpose", "requested_by"),
+        "shift": ("dispatcher_id", "area", "starts_at", "ends_at"),
     }
     ACTION_REQUIRED = {
         ("inspection", "pass"): ("findings",),
@@ -202,6 +245,7 @@ class RuleEngine:
         "rescue_job": ("admin", "dispatcher"),
         "remediation": ("admin", "inspector", "maintenance"),
         "permit": ("admin", "inspector"),
+        "shift": ("admin", "dispatcher", "supervisor"),
     }
     ROLE_ACTIONS = {
         "suspend": ("admin", "inspector"),
@@ -225,6 +269,11 @@ class RuleEngine:
         "grant": ("admin", "inspector"),
         "revoke": ("admin", "inspector"),
         "expire": ("admin", "inspector"),
+        ("shift", "start_duty"): ("admin", "dispatcher", "supervisor"),
+        ("shift", "begin_handover"): ("admin", "dispatcher", "supervisor"),
+        ("shift", "end_shift"): ("admin", "dispatcher", "supervisor"),
+        ("handover", "complete"): ("admin", "dispatcher", "supervisor"),
+        ("escalation", "resolve"): ("admin", "supervisor"),
     }
     CUSTOM_CREATE = {
         "equipment": lambda a, d, l: _validate_equipment(d, l),
@@ -234,6 +283,7 @@ class RuleEngine:
         "rescue_job": lambda a, d, l: _validate_rescue(d, l),
         "remediation": lambda a, d, l: _validate_remediation(d, l),
         "permit": lambda a, d, l: _validate_permit(d, l),
+        "shift": lambda a, d, l: _validate_shift(a, d, l),
     }
     CUSTOM_TRANSITIONS = {
         ("permit", "grant"): _grant_permit,

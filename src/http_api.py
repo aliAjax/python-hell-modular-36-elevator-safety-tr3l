@@ -84,6 +84,13 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if parts == ["api", "alarm-takeovers"]:
+                    query = parse_qs(parsed.query)
+                    return self._send(200, {"items": service.list_takeovers(
+                        alarm_id=query.get("alarm_id", [None])[0],
+                        shift_id=query.get("shift_id", [None])[0],
+                        status=query.get("status", [None])[0],
+                    )})
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api" and parts[1] != "entities":
@@ -104,6 +111,24 @@ def create_handler(service, rules, static_dir):
                 if parts == ["api", "offline-records"]:
                     body = self._body()
                     return self._send(200, {"items": service.merge_offline(actor, body.get("records", []))})
+                if len(parts) == 4 and parts[:2] == ["api", "alarms"] and parts[3] == "takeover":
+                    body = self._body()
+                    shift_id = body.get("shift_id")
+                    if not shift_id:
+                        raise ValidationError("shift_id is required")
+                    return self._send(201, service.takeover_alarm(actor, parts[2], shift_id))
+                if len(parts) == 4 and parts[:2] == ["api", "handovers"] and parts[3] == "takeover":
+                    body = self._body()
+                    shift_id = body.get("shift_id")
+                    if not shift_id:
+                        raise ValidationError("shift_id is required")
+                    return self._send(201, service.takeover_all_handover_alarms(actor, parts[2], shift_id))
+                if len(parts) == 4 and parts[:2] == ["api", "shifts"] and parts[3] == "handover":
+                    body = self._body()
+                    return self._send(201, service.begin_handover(actor, parts[2], body.get("expected_version")))
+                if len(parts) == 4 and parts[:2] == ["api", "shifts"] and parts[3] == "end":
+                    body = self._body()
+                    return self._send(200, service.end_shift(actor, parts[2], body.get("expected_version")))
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)
